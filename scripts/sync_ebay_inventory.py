@@ -162,8 +162,14 @@ def get_shopify_inventory():
     return inventory
 
 
+def max_qty_for_sku(sku):
+    """SET4-<truck name> SKUs (set-of-4 truck-specific listings) are capped at 1;
+    everything else is capped at 4."""
+    return 1 if 'SET4-' in sku else 4
+
+
 def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
-    matched = {item_id: [(sku, min(inventory[sku], 4)) for sku in skus if sku in inventory]
+    matched = {item_id: [(sku, min(inventory[sku], max_qty_for_sku(sku))) for sku in skus if sku in inventory]
                for item_id, skus in items.items()}
     matched = {k: v for k, v in matched.items() if v}
 
