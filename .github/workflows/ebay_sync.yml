@@ -1,4 +1,5 @@
 name: eBay Inventory Sync
+# (touched to force GitHub to register this workflow)
 
 on:
   schedule:
