@@ -14,13 +14,20 @@ EBAY_CERT_ID    = os.environ.get('EBAY_CERT_ID')
 EBAY_USER_TOKEN = os.environ.get('EBAY_USER_TOKEN')
 EBAY_API_URL    = 'https://api.ebay.com/ws/api.dll'
 
+# eBay accounts to sync, all under the same developer keyset (EBAY_APP_ID/DEV_ID/CERT_ID).
+# Add more (name, env var) pairs here as additional stores are authorized.
+EBAY_ACCOUNTS = [
+    # ('saleswbrteam', EBAY_USER_TOKEN),  # disabled — syncing to wheelstires only
+    ('wheelstires', os.environ.get('EBAY_USER_TOKEN_WHEELSTIRES')),
+]
+
 SHOPIFY_STORE_URL    = os.environ.get('SHOPIFY_STORE_URL')
 SHOPIFY_ACCESS_TOKEN = os.environ.get('SHOPIFY_ACCESS_TOKEN')
 
 NS = {'e': 'urn:ebay:apis:eBLBaseComponents'}
 
 
-def ebay_call(call_name, body_xml):
+def ebay_call(call_name, body_xml, user_token=EBAY_USER_TOKEN):
     headers = {
         'X-EBAY-API-SITEID': '0',
         'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
@@ -33,7 +40,7 @@ def ebay_call(call_name, body_xml):
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <{call_name}Request xmlns="urn:ebay:apis:eBLBaseComponents">
   <RequesterCredentials>
-    <eBayAuthToken>{EBAY_USER_TOKEN}</eBayAuthToken>
+    <eBayAuthToken>{user_token}</eBayAuthToken>
   </RequesterCredentials>
   {body_xml}
 </{call_name}Request>"""
@@ -47,7 +54,7 @@ def ebay_call(call_name, body_xml):
             time.sleep(5)
 
 
-def get_ebay_listings():
+def get_ebay_listings(user_token=EBAY_USER_TOKEN):
     """Return dict of item_id -> [sku, ...] for all active listings.
     Uses GetSellerList+Fine to get variation-level SKUs.
     GTC listings always end within 30 days, so EndTimeTo=now+32 captures all.
@@ -67,7 +74,7 @@ def get_ebay_listings():
     <PageNumber>{page}</PageNumber>
     <EntriesPerPage>200</EntriesPerPage>
   </Pagination>
-""")
+""", user_token=user_token)
         ack = root.findtext('e:Ack', '', NS)
         if ack == 'Failure':
             for err in root.findall('.//e:Errors', NS):
@@ -155,7 +162,7 @@ def get_shopify_inventory():
     return inventory
 
 
-def update_ebay_quantities(items, inventory):
+def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
     matched = {item_id: [(sku, min(inventory[sku], 4)) for sku in skus if sku in inventory]
                for item_id, skus in items.items()}
     matched = {k: v for k, v in matched.items() if v}
@@ -177,7 +184,7 @@ def update_ebay_quantities(items, inventory):
     <ItemID>{item_id}</ItemID>
     <Variations>{vars_xml}</Variations>
   </Item>
-""")
+""", user_token=user_token)
         ack = root.findtext('e:Ack', '', NS)
         if ack in ('Success', 'Warning'):
             updated += 1
@@ -189,7 +196,7 @@ def update_ebay_quantities(items, inventory):
                 qty = var_list[0][1]
                 root2 = ebay_call('ReviseFixedPriceItem', f"""
   <Item><ItemID>{item_id}</ItemID><Quantity>{qty}</Quantity></Item>
-""")
+""", user_token=user_token)
                 if root2.findtext('e:Ack', '', NS) in ('Success', 'Warning'):
                     updated += 1
                 else:
@@ -207,22 +214,25 @@ def update_ebay_quantities(items, inventory):
 
 
 def main():
-    if not all([EBAY_APP_ID, EBAY_DEV_ID, EBAY_CERT_ID, EBAY_USER_TOKEN, SHOPIFY_STORE_URL, SHOPIFY_ACCESS_TOKEN]):
+    accounts = [(name, token) for name, token in EBAY_ACCOUNTS if token]
+    if not all([EBAY_APP_ID, EBAY_DEV_ID, EBAY_CERT_ID, SHOPIFY_STORE_URL, SHOPIFY_ACCESS_TOKEN]) or not accounts:
         print("ERROR: Missing credentials in environment.", flush=True)
         return
 
     print("=== Shopify -> eBay Inventory Sync ===", flush=True)
-    ebay_listings = get_ebay_listings()
-    if not ebay_listings:
-        print("No eBay listings found.", flush=True)
-        return
-
     shopify_inventory = get_shopify_inventory()
     if not shopify_inventory:
         print("No Shopify inventory found.", flush=True)
         return
 
-    update_ebay_quantities(ebay_listings, shopify_inventory)
+    for name, token in accounts:
+        print(f"--- eBay account: {name} ---", flush=True)
+        ebay_listings = get_ebay_listings(user_token=token)
+        if not ebay_listings:
+            print(f"No eBay listings found for {name}.", flush=True)
+            continue
+        update_ebay_quantities(ebay_listings, shopify_inventory, user_token=token)
+
     print("All done.", flush=True)
 
 
