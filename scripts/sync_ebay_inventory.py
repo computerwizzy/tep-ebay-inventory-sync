@@ -55,11 +55,11 @@ def ebay_call(call_name, body_xml, user_token=EBAY_USER_TOKEN):
 
 
 def get_ebay_listings(user_token=EBAY_USER_TOKEN):
-    """Return dict of item_id -> [sku, ...] for all active listings.
+    """Return dict of item_id -> {'skus': [sku, ...], 'is_variation': bool} for all active listings.
     Uses GetSellerList+Fine to get variation-level SKUs.
     GTC listings always end within 30 days, so EndTimeTo=now+32 captures all.
     """
-    items = {}  # item_id -> [sku, ...]
+    items = {}  # item_id -> {'skus': [...], 'is_variation': bool}
     page = 1
     now = datetime.datetime.now(datetime.timezone.utc)
     end_from = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
@@ -97,7 +97,7 @@ def get_ebay_listings(user_token=EBAY_USER_TOKEN):
                 if sku:
                     skus.append(sku)
             if skus:
-                items[item_id] = skus
+                items[item_id] = {'skus': skus, 'is_variation': bool(variations)}
 
         has_more = root.findtext('.//e:HasMoreItems', 'false', NS)
         if has_more.lower() != 'true':
@@ -105,7 +105,7 @@ def get_ebay_listings(user_token=EBAY_USER_TOKEN):
         page += 1
         time.sleep(0.5)
 
-    total_skus = sum(len(v) for v in items.values())
+    total_skus = sum(len(v['skus']) for v in items.values())
     print(f"eBay active listings: {len(items):,} | SKUs: {total_skus:,}", flush=True)
     return items
 
@@ -169,9 +169,11 @@ def max_qty_for_sku(sku):
 
 
 def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
-    matched = {item_id: [(sku, min(inventory[sku], max_qty_for_sku(sku))) for sku in skus if sku in inventory]
-               for item_id, skus in items.items()}
-    matched = {k: v for k, v in matched.items() if v}
+    matched = {}
+    for item_id, info in items.items():
+        var_list = [(sku, min(inventory[sku], max_qty_for_sku(sku))) for sku in info['skus'] if sku in inventory]
+        if var_list:
+            matched[item_id] = {'vars': var_list, 'is_variation': info['is_variation']}
 
     if not matched:
         print("No matching SKUs found between eBay and Shopify.", flush=True)
@@ -179,8 +181,30 @@ def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
 
     print(f"Syncing {len(matched):,} eBay listings...", flush=True)
     updated = 0
+    ended = 0
 
-    for item_id, var_list in matched.items():
+    for item_id, m in matched.items():
+        var_list = m['vars']
+        skus_str = ', '.join(f"{sku}={qty}" for sku, qty in var_list)
+
+        # Single-SKU (non-variation) listings can't be revised to Quantity=0 —
+        # eBay rejects it unless "Out of stock" control is enabled on the account.
+        # End the listing instead so it can't be oversold.
+        if not m['is_variation'] and var_list[0][1] == 0:
+            root = ebay_call('EndFixedPriceItem', f"""
+  <ItemID>{item_id}</ItemID>
+  <EndingReason>NotAvailable</EndingReason>
+""", user_token=user_token)
+            if root.findtext('e:Ack', '', NS) in ('Success', 'Warning'):
+                ended += 1
+                print(f"  Ended (ItemID {item_id}, SKU {skus_str}): out of stock in Shopify", flush=True)
+            else:
+                for e in root.findall('.//e:Errors', NS):
+                    if e.findtext('e:SeverityCode', '', NS) == 'Error':
+                        print(f"  Error ending (ItemID {item_id}, SKU {skus_str}): {e.findtext('e:LongMessage', '', NS)}", flush=True)
+            time.sleep(0.25)
+            continue
+
         vars_xml = ''.join(
             f"<Variation><SKU>{sku}</SKU><Quantity>{qty}</Quantity></Variation>"
             for sku, qty in var_list
@@ -208,15 +232,15 @@ def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
                 else:
                     for e in root2.findall('.//e:Errors', NS):
                         if e.findtext('e:SeverityCode', '', NS) == 'Error':
-                            print(f"  Error (ItemID {item_id}): {e.findtext('e:LongMessage', '', NS)}", flush=True)
+                            print(f"  Error (ItemID {item_id}, SKU {skus_str}): {e.findtext('e:LongMessage', '', NS)}", flush=True)
             else:
                 for e in errors:
                     msg = e.findtext('e:LongMessage', '', NS) or ''
                     if e.findtext('e:SeverityCode', '', NS) == 'Error' and 'ended' not in msg.lower():
-                        print(f"  Error (ItemID {item_id}): {msg}", flush=True)
+                        print(f"  Error (ItemID {item_id}, SKU {skus_str}): {msg}", flush=True)
         time.sleep(0.25)
 
-    print(f"eBay inventory sync complete: {updated:,} listings updated.", flush=True)
+    print(f"eBay inventory sync complete: {updated:,} listings updated, {ended:,} ended (out of stock).", flush=True)
 
 
 def main():
