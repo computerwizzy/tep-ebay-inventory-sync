@@ -65,6 +65,15 @@ def get_ebay_listings(user_token=EBAY_USER_TOKEN):
     """Return dict of item_id -> {'skus': [sku, ...], 'is_variation': bool} for all active listings.
     Uses GetSellerList+Fine to get variation-level SKUs.
     GTC listings always end within 30 days, so EndTimeTo=now+32 captures all.
+
+    Two eBay quirks this works around:
+    - GetSellerList filters by the request's SiteID, and wheel/tire listings often live
+      under eBayMotors (site 100) rather than the default US site (0) — querying with
+      site 100 returns the complete set (confirmed against GetMyeBaySelling's total),
+      so that's used here instead of the default.
+    - GetSellerList only returns a <Variations> block if <IncludeVariations>true</IncludeVariations>
+      is explicitly requested; without it, a multi-variation listing has neither Variations
+      nor a top-level SKU and silently drops out of the sync entirely.
     """
     items = {}  # item_id -> {'skus': [...], 'is_variation': bool}
     page = 1
@@ -77,11 +86,12 @@ def get_ebay_listings(user_token=EBAY_USER_TOKEN):
   <EndTimeFrom>{end_from}</EndTimeFrom>
   <EndTimeTo>{end_to}</EndTimeTo>
   <GranularityLevel>Fine</GranularityLevel>
+  <IncludeVariations>true</IncludeVariations>
   <Pagination>
     <PageNumber>{page}</PageNumber>
     <EntriesPerPage>200</EntriesPerPage>
   </Pagination>
-""", user_token=user_token)
+""", user_token=user_token, site_id='100')
         ack = root.findtext('e:Ack', '', NS)
         if ack == 'Failure':
             for err in root.findall('.//e:Errors', NS):
