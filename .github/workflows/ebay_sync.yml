@@ -5,6 +5,9 @@ on:
     - cron: '0 */4 * * *'   # every 4 hours
   workflow_dispatch: {}      # allow manual "Run workflow" from the Actions tab
 
+permissions:
+  contents: write   # needed to commit data/ended_listings.json back to the repo
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -28,3 +31,11 @@ jobs:
           SHOPIFY_STORE_URL: ${{ secrets.SHOPIFY_STORE_URL }}
           SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
         run: python scripts/sync_ebay_inventory.py
+
+      - name: Commit ended-listings state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/ended_listings.json
+          git diff --cached --quiet || git commit -m "Update ended-listings state [skip ci]"
+          git push

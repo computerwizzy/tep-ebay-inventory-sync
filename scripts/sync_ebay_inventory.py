@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import datetime
 import requests
@@ -7,6 +8,8 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
+
+ENDED_STATE_PATH = os.path.join(BASE_DIR, 'data', 'ended_listings.json')
 
 EBAY_APP_ID     = os.environ.get('EBAY_APP_ID')
 EBAY_DEV_ID     = os.environ.get('EBAY_DEV_ID')
@@ -27,9 +30,13 @@ SHOPIFY_ACCESS_TOKEN = os.environ.get('SHOPIFY_ACCESS_TOKEN')
 NS = {'e': 'urn:ebay:apis:eBLBaseComponents'}
 
 
-def ebay_call(call_name, body_xml, user_token=EBAY_USER_TOKEN):
+# eBay Trading API SiteID codes referenced by this script (there are more; add as needed).
+SITE_NAME_TO_ID = {'US': '0', 'eBayMotors': '100'}
+
+
+def ebay_call(call_name, body_xml, user_token=EBAY_USER_TOKEN, site_id='0'):
     headers = {
-        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-SITEID': site_id,
         'X-EBAY-API-COMPATIBILITY-LEVEL': '967',
         'X-EBAY-API-CALL-NAME': call_name,
         'X-EBAY-API-APP-NAME': EBAY_APP_ID,
@@ -168,7 +175,81 @@ def max_qty_for_sku(sku):
     return 1 if 'SET4-' in sku else 4
 
 
-def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
+def load_ended_state():
+    """Listings this script has ended for hitting 0 in Shopify, keyed by account name.
+    Persisted to disk (and committed back to the repo by the GitHub Actions workflow)
+    so a later run can find them again — an ended listing no longer shows up in
+    get_ebay_listings(), so this is the only record that it should be relisted once
+    its SKU is back in stock.
+    """
+    if not os.path.exists(ENDED_STATE_PATH):
+        return {}
+    with open(ENDED_STATE_PATH) as f:
+        return json.load(f)
+
+
+def save_ended_state(state):
+    os.makedirs(os.path.dirname(ENDED_STATE_PATH), exist_ok=True)
+    with open(ENDED_STATE_PATH, 'w') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+        f.write('\n')
+
+
+def relist_restocked_items(account_ended, inventory, user_token=EBAY_USER_TOKEN):
+    """Relist single-SKU listings we previously ended, now that their SKU is back
+    in stock in Shopify. Mutates account_ended in place, removing relisted entries."""
+    to_relist = [
+        (item_id, entry['sku']) for item_id, entry in account_ended.items()
+        if inventory.get(entry['sku'], 0) > 0
+    ]
+    if not to_relist:
+        return 0
+
+    print(f"Relisting {len(to_relist):,} previously-ended listings back in stock...", flush=True)
+    relisted = 0
+    for item_id, sku in to_relist:
+        qty = min(inventory[sku], max_qty_for_sku(sku))
+
+        # RelistFixedPriceItem enforces that the SiteID header match the listing's
+        # original site (unlike Revise/GetItem, which tolerate a mismatch) — e.g.
+        # wheel/tire listings often live under eBayMotors (100), not the default
+        # US site (0). Look it up per item rather than assuming.
+        item_root = ebay_call('GetItem', f"<ItemID>{item_id}</ItemID>", user_token=user_token)
+        site_name = item_root.findtext('.//e:Item/e:Site', 'US', NS)
+        site_id = SITE_NAME_TO_ID.get(site_name, '0')
+
+        root = ebay_call('RelistFixedPriceItem', f"""
+  <Item>
+    <ItemID>{item_id}</ItemID>
+    <Quantity>{qty}</Quantity>
+  </Item>
+""", user_token=user_token, site_id=site_id)
+        ack = root.findtext('e:Ack', '', NS)
+        if ack in ('Success', 'Warning'):
+            new_item_id = root.findtext('e:ItemID', '', NS)
+            relisted += 1
+            del account_ended[item_id]
+            print(f"  Relisted (old ItemID {item_id} -> new ItemID {new_item_id}, SKU {sku}={qty}): back in stock", flush=True)
+        else:
+            errors = root.findall('.//e:Errors', NS)
+            # ErrorCode 21919067: "you already have an identical listing active" —
+            # something else (a manual relist, etc.) already put this SKU back on
+            # eBay since we ended it. Nothing to do; stop tracking it.
+            already_relisted = any(e.findtext('e:ErrorCode', '', NS) == '21919067' for e in errors)
+            if already_relisted:
+                del account_ended[item_id]
+                print(f"  Skipped (ItemID {item_id}, SKU {sku}): already relisted elsewhere, dropping from tracked state", flush=True)
+            else:
+                for e in errors:
+                    if e.findtext('e:SeverityCode', '', NS) == 'Error':
+                        print(f"  Error relisting (ItemID {item_id}, SKU {sku}): {e.findtext('e:LongMessage', '', NS)}", flush=True)
+        time.sleep(0.25)
+
+    print(f"Relisting complete: {relisted:,} listings relisted.", flush=True)
+    return relisted
+
+
+def update_ebay_quantities(items, inventory, account_ended, user_token=EBAY_USER_TOKEN):
     matched = {}
     for item_id, info in items.items():
         var_list = [(sku, min(inventory[sku], max_qty_for_sku(sku))) for sku in info['skus'] if sku in inventory]
@@ -189,7 +270,8 @@ def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
 
         # Single-SKU (non-variation) listings can't be revised to Quantity=0 —
         # eBay rejects it unless "Out of stock" control is enabled on the account.
-        # End the listing instead so it can't be oversold.
+        # End the listing instead so it can't be oversold, and remember it so a
+        # later run can relist it once Shopify has stock again.
         if not m['is_variation'] and var_list[0][1] == 0:
             root = ebay_call('EndFixedPriceItem', f"""
   <ItemID>{item_id}</ItemID>
@@ -197,6 +279,7 @@ def update_ebay_quantities(items, inventory, user_token=EBAY_USER_TOKEN):
 """, user_token=user_token)
             if root.findtext('e:Ack', '', NS) in ('Success', 'Warning'):
                 ended += 1
+                account_ended[item_id] = {'sku': var_list[0][0]}
                 print(f"  Ended (ItemID {item_id}, SKU {skus_str}): out of stock in Shopify", flush=True)
             else:
                 for e in root.findall('.//e:Errors', NS):
@@ -255,14 +338,21 @@ def main():
         print("No Shopify inventory found.", flush=True)
         return
 
+    ended_state = load_ended_state()
+
     for name, token in accounts:
         print(f"--- eBay account: {name} ---", flush=True)
+        account_ended = ended_state.setdefault(name, {})
+
+        relist_restocked_items(account_ended, shopify_inventory, user_token=token)
+
         ebay_listings = get_ebay_listings(user_token=token)
         if not ebay_listings:
             print(f"No eBay listings found for {name}.", flush=True)
             continue
-        update_ebay_quantities(ebay_listings, shopify_inventory, user_token=token)
+        update_ebay_quantities(ebay_listings, shopify_inventory, account_ended, user_token=token)
 
+    save_ended_state(ended_state)
     print("All done.", flush=True)
 
 
